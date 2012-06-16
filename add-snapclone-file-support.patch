@@ -134,7 +134,7 @@ index 50248e6..767f424 100644
  		/* set extent flag only for directory, file and normal symlink*/
  		if (S_ISDIR(mode) || S_ISREG(mode) || S_ISLNK(mode)) {
 diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
-index 6d876c8..ad0ac61 100644
+index 6d876c8..a861217 100644
 --- a/fs/ext4/inode.c
 +++ b/fs/ext4/inode.c
 @@ -171,6 +171,10 @@ void ext4_evict_inode(struct inode *inode)
@@ -148,7 +148,53 @@ index 6d876c8..ad0ac61 100644
  		goto no_delete;
  	}
  
-@@ -767,6 +771,10 @@ int ext4_get_block_mow(struct inode *inode, sector_t iblock,
+@@ -676,13 +680,30 @@ static int ext4_partial_write_begin(struct inode *inode, sector_t iblock,
+ 	map.m_lblk = iblock;
+ 	map.m_len = 1;
+ 
++#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
++	if (ext4_snapclone_file(inode)) {
++		ret = ext4_snapshot_get_block(inode, iblock, bh, 0);
++		if (ret == 0) {
++			BUG_ON(!buffer_mapped(bh));
++			ret = 1;
++		}
++	} else {
++		ret = ext4_map_blocks(NULL, inode, &map, 0);
++	}
++#else
+ 	ret = ext4_map_blocks(NULL, inode, &map, 0);
++#endif
+ 	if (ret <= 0)
+ 		return ret;
+ 
+ 	if (!buffer_uptodate(bh) && !buffer_unwritten(bh)) {
+ 		/* map existing block for read */
++#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
++		if (!ext4_snapclone_file(inode))
++			map_bh(bh, inode->i_sb, map.m_pblk);
++#else
+ 		map_bh(bh, inode->i_sb, map.m_pblk);
++#endif
+ 		ll_rw_block(READ, 1, &bh);
+ 		wait_on_buffer(bh);
+ 		/* clear existing block mapping */
+@@ -728,8 +749,14 @@ static int _ext4_get_block(struct inode *inode, sector_t iblock,
+ 	}
+ 
+ #ifdef CONFIG_EXT4_FS_SNAPSHOT_HOOKS_DATA
++#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
++	if (((flags & EXT4_GET_BLOCKS_MOVE_ON_WRITE) ||
++	     ext4_snapclone_file(inode)) &&
++	    buffer_partial_write(bh)) {
++#else
+ 	if ((flags & EXT4_GET_BLOCKS_MOVE_ON_WRITE) &&
+ 	     buffer_partial_write(bh)) {
++#endif
+ 		/* Read existing block data before moving it to snapshot */
+ 		ret = ext4_partial_write_begin(inode, iblock, bh);
+ 		if (ret < 0)
+@@ -767,6 +794,10 @@ int ext4_get_block_mow(struct inode *inode, sector_t iblock,
  {
  	int flags = create ? EXT4_GET_BLOCKS_CREATE : 0;
  
@@ -159,7 +205,7 @@ index 6d876c8..ad0ac61 100644
  	if (ext4_snapshot_should_move_data(inode))
  		flags |= EXT4_GET_BLOCKS_MOVE_ON_WRITE;
  	return _ext4_get_block(inode, iblock, bh, flags);
-@@ -1000,8 +1008,15 @@ static void ext4_snapshot_write_begin(struct inode *inode,
+@@ -1000,8 +1031,15 @@ static void ext4_snapshot_write_begin(struct inode *inode,
  	 * guarantee this we have to know that the transaction is not restarted.
  	 * Can we count on that?
  	 */
@@ -175,7 +221,7 @@ index 6d876c8..ad0ac61 100644
  		return;
  
  	if (!page_has_buffers(page))
-@@ -1011,7 +1026,7 @@ static void ext4_snapshot_write_begin(struct inode *inode,
+@@ -1011,14 +1049,19 @@ static void ext4_snapshot_write_begin(struct inode *inode,
  	/*
  	 * make sure that get_block() is called even if the buffer is
  	 * mapped, but not if it is already a part of any transaction.
@@ -184,18 +230,30 @@ index 6d876c8..ad0ac61 100644
  	 * data buffers are flushed on snapshot take via freeze_fs()
  	 * API.
  	 */
-@@ -1753,6 +1768,10 @@ static void mpage_da_map_and_submit(struct mpage_da_data *mpd)
+ 	if (!buffer_jbd(bh) && !buffer_delay(bh)) {
+ 		clear_buffer_mapped(bh);
+ 		/* explicitly request move-on-write */
++#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
++		if ((!delay || ext4_snapclone_file(inode)) &&
++		    len < PAGE_CACHE_SIZE)
++#else
+ 		if (!delay && len < PAGE_CACHE_SIZE)
++#endif
+ 			/* read block before moving it to snapshot */
+ 			set_buffer_partial_write(bh);
+ 	}
+@@ -1753,6 +1796,10 @@ static void mpage_da_map_and_submit(struct mpage_da_data *mpd)
  	 * EXT4_GET_BLOCKS_DELALLOC_RESERVE so the delalloc accounting
  	 * variables are updated after the blocks have been allocated.
  	 */
-+#ifdef CONFIG_EXT4_FS_SNAPSHOT_HOOKS_DATA
-+	if (ext4_snapclone_file(inode))
++#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
++	if (ext4_snapclone_file(mpd->inode))
 +		next = SNAPSHOT_IBLOCK(next);
 +#endif
  	map.m_lblk = next;
  	map.m_len = max_blocks;
  	get_blocks_flags = EXT4_GET_BLOCKS_CREATE;
-@@ -2054,6 +2073,10 @@ static int ext4_da_get_block_prep(struct inode *inode, sector_t iblock,
+@@ -2054,6 +2101,10 @@ static int ext4_da_get_block_prep(struct inode *inode, sector_t iblock,
  	BUG_ON(create == 0);
  	BUG_ON(bh->b_size != inode->i_sb->s_blocksize);
  
@@ -206,7 +264,7 @@ index 6d876c8..ad0ac61 100644
  	map.m_lblk = iblock;
  	map.m_len = 1;
  
-@@ -3064,6 +3087,11 @@ static int ext4_get_block_write(struct inode *inode, sector_t iblock,
+@@ -3064,6 +3115,10 @@ static int ext4_get_block_write(struct inode *inode, sector_t iblock,
  		   inode->i_ino, create);
  	if (ext4_snapshot_should_move_data(inode))
  		flags |= EXT4_GET_BLOCKS_MOVE_ON_WRITE;
@@ -214,11 +272,10 @@ index 6d876c8..ad0ac61 100644
 +	if (ext4_snapclone_file(inode))
 +		iblock = SNAPSHOT_IBLOCK(iblock);
 +#endif
-+#endif
  	return _ext4_get_block(inode, iblock, bh_result, flags);
  #else
  	ext4_debug("ext4_get_block_write: inode %lu, create flag %d\n",
-@@ -3408,6 +3436,25 @@ static const struct address_space_operations ext4_da_aops = {
+@@ -3408,6 +3463,25 @@ static const struct address_space_operations ext4_da_aops = {
  	.is_partially_uptodate  = block_is_partially_uptodate,
  	.error_remove_page	= generic_error_remove_page,
  };
@@ -244,7 +301,7 @@ index 6d876c8..ad0ac61 100644
  #ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE
  static int ext4_no_writepage(struct page *page,
  				struct writeback_control *wbc)
-@@ -3448,6 +3495,11 @@ void ext4_set_aops(struct inode *inode)
+@@ -3448,6 +3522,11 @@ void ext4_set_aops(struct inode *inode)
  		inode->i_mapping->a_ops = &ext4_snapfile_aops;
  	else
  #endif
@@ -256,7 +313,7 @@ index 6d876c8..ad0ac61 100644
  	if (ext4_should_order_data(inode) &&
  		test_opt(inode->i_sb, DELALLOC))
  		inode->i_mapping->a_ops = &ext4_da_aops;
-@@ -4078,7 +4130,11 @@ struct inode *ext4_iget(struct super_block *sb, unsigned long ino)
+@@ -4078,7 +4157,11 @@ struct inode *ext4_iget(struct super_block *sb, unsigned long ino)
  		ei->i_data[block] = raw_inode->i_block[block];
  #ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE_STORE
  	/* snapshot on-disk list is stored in snapshot inode on-disk version */
@@ -268,7 +325,7 @@ index 6d876c8..ad0ac61 100644
  		ei->i_next_snapshot_ino =
  			le32_to_cpu(raw_inode->i_disk_version);
  		/*
-@@ -4091,6 +4147,13 @@ struct inode *ext4_iget(struct super_block *sb, unsigned long ino)
+@@ -4091,6 +4174,13 @@ struct inode *ext4_iget(struct super_block *sb, unsigned long ino)
  #endif
  	INIT_LIST_HEAD(&ei->i_orphan);
  
@@ -282,7 +339,7 @@ index 6d876c8..ad0ac61 100644
  	/*
  	 * Set transaction id's of transactions that have to be committed
  	 * to finish f[data]sync. We set them to currently running transaction
-@@ -4361,7 +4424,11 @@ static int ext4_do_update_inode(handle_t *handle,
+@@ -4361,7 +4451,11 @@ static int ext4_do_update_inode(handle_t *handle,
  			raw_inode->i_block[block] = ei->i_data[block];
  
  #ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE_STORE
@@ -394,7 +451,7 @@ index e239d67..e7286fa 100644
  	case EXT4_IOC_GETVERSION_OLD:
  		return put_user(inode->i_generation, (int __user *) arg);
 diff --git a/fs/ext4/snapshot.h b/fs/ext4/snapshot.h
-index 9b91f16..4d7c6ef 100644
+index 9b91f16..8cff1cb 100644
 --- a/fs/ext4/snapshot.h
 +++ b/fs/ext4/snapshot.h
 @@ -417,6 +417,15 @@ extern int ext4_snapshot_update(struct super_block *sb, int cleanup,
@@ -413,7 +470,19 @@ index 9b91f16..4d7c6ef 100644
  static inline int init_ext4_snapshot(void)
  {
  #ifdef CONFIG_EXT4_FS_SNAPSHOT_JOURNAL_CACHE
-@@ -458,6 +467,22 @@ static inline int ext4_snapshot_list(struct inode *inode)
+@@ -442,6 +451,11 @@ extern int ext4_snapshot_merge_blocks(handle_t *handle,
+ 		ext4_lblk_t iblock, unsigned long maxblocks);
+ #endif
+ 
++#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
++extern int ext4_snapshot_get_block(struct inode *inode, sector_t iblock,
++				   struct buffer_head *bh_result, int create);
++#endif
++
+ #ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE
+ /* tests if @inode is a snapshot file */
+ static inline int ext4_snapshot_file(struct inode *inode)
+@@ -458,6 +472,22 @@ static inline int ext4_snapshot_list(struct inode *inode)
  	return ext4_test_inode_snapstate(inode, EXT4_SNAPSTATE_LIST);
  }
  #endif
@@ -775,7 +844,7 @@ index 330d5a3..92168f9 100644
   * Snapshot constructor/destructor
   */
 diff --git a/fs/ext4/snapshot_inode.c b/fs/ext4/snapshot_inode.c
-index 796b355..dd117bc 100644
+index 796b355..9aa4c29 100644
 --- a/fs/ext4/snapshot_inode.c
 +++ b/fs/ext4/snapshot_inode.c
 @@ -645,19 +645,27 @@ static int ext4_snapshot_get_block_access(struct inode *inode,
@@ -809,13 +878,17 @@ index 796b355..dd117bc 100644
  		/* non snapshot file on the list? */
  		return -EIO;
  
-@@ -990,3 +998,9 @@ int ext4_snapshot_readpage(struct file *file, struct page *page)
- 	return ext4_read_full_page(page, ext4_snapshot_get_block);
+@@ -919,8 +927,13 @@ static int ext4_snapshot_is_bitmap(struct super_block *sb,
+ 	return is_bitmap;
  }
- #endif
-+
+ 
 +#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
-+int ext4_snapclone_writepage(struct file *file, struct page *page)
-+{
-+}
++int ext4_snapshot_get_block(struct inode *inode, sector_t iblock,
++			    struct buffer_head *bh_result, int create)
++#else
+ static int ext4_snapshot_get_block(struct inode *inode, sector_t iblock,
+ 			struct buffer_head *bh_result, int create)
 +#endif
+ {
+ 	ext4_group_t block_group;
+ 	int err, is_bitmap;
