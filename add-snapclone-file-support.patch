@@ -25,7 +25,7 @@ index 739ecc9..ee33398 100644
  	bool "snapshot file - read through to block device"
  	depends on EXT4_FS_SNAPSHOT_FILE
 diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
-index 0e8eef5..30d646f 100644
+index 0e8eef5..4a9cfe4 100644
 --- a/fs/ext4/ext4.h
 +++ b/fs/ext4/ext4.h
 @@ -472,12 +472,27 @@ struct flex_groups {
@@ -74,17 +74,7 @@ index 0e8eef5..30d646f 100644
  	EXT4_INODE_RESERVED	= 31,	/* reserved for ext4 lib */
  };
  
-@@ -735,6 +754,9 @@ enum {
- #endif
- #define EXT4_IOC_MOVE_EXT		_IOWR('f', 15, struct move_extent)
- #define EXT4_IOC_RESIZE_FS		_IOW('f', 16, __u64)
-+#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
-+#define EXT4_IOC_SNAPCLONE		_IOW('f', 17, long)
-+#endif
- 
- #if defined(__KERNEL__) && defined(CONFIG_COMPAT)
- /*
-@@ -1079,6 +1101,9 @@ struct ext4_inode_info {
+@@ -1079,6 +1098,9 @@ struct ext4_inode_info {
  #define EXT4_FLAGS_IS_SNAPSHOT		0x0010 /* Is a snapshot image */
  #define EXT4_FLAGS_FIX_SNAPSHOT		0x0020 /* Corrupted snapshot */
  #define EXT4_FLAGS_FIX_EXCLUDE		0x0040 /* Bad exclude bitmap */
@@ -94,7 +84,7 @@ index 0e8eef5..30d646f 100644
  
  #define EXT4_SET_FLAGS(sb, mask)				 \
  	do {							 \
-@@ -1509,6 +1534,7 @@ enum {
+@@ -1509,6 +1531,7 @@ enum {
  	EXT4_SNAPSTATE_SHRUNK = 5,	/* snapshot was shrunk (h) */
  	EXT4_SNAPSTATE_OPEN = 6,	/* snapshot is mounted (o) */
  	EXT4_SNAPSTATE_TAGGED = 7,	/* snapshot is tagged  (t) */
@@ -102,8 +92,19 @@ index 0e8eef5..30d646f 100644
  	EXT4_SNAPSTATE_LAST
  #endif
  };
+@@ -2228,6 +2251,10 @@ extern int ext4_orphan_add(handle_t *, struct inode *);
+ extern int ext4_orphan_del(handle_t *, struct inode *);
+ extern int ext4_htree_fill_tree(struct file *dir_file, __u32 start_hash,
+ 				__u32 start_minor_hash, __u32 *next_hash);
++#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
++extern int ext4_add_nondir(handle_t *handle,
++		struct dentry *dentry, struct inode *inode);
++#endif
+ 
+ /* resize.c */
+ extern int ext4_group_add(struct super_block *sb,
 diff --git a/fs/ext4/file.c b/fs/ext4/file.c
-index 0e6e33f..51cbfde 100644
+index 0e6e33f..47f4ebe 100644
 --- a/fs/ext4/file.c
 +++ b/fs/ext4/file.c
 @@ -50,6 +50,7 @@ static int ext4_release_file(struct inode *inode, struct file *filp)
@@ -114,6 +115,18 @@ index 0e6e33f..51cbfde 100644
  	if (is_dx(inode) && filp->private_data)
  		ext4_htree_free_dir_info(filp->private_data);
  
+@@ -169,7 +170,11 @@ static int ext4_file_open(struct inode * inode, struct file * filp)
+ 	char buf[64], *cp;
+ 
+ #ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE_PERM
++#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
++	if (ext4_snapshot_file(inode) && !ext4_snapclone_file(inode) &&
++#else
+ 	if (ext4_snapshot_file(inode) &&
++#endif
+ 		(filp->f_flags & O_ACCMODE) != O_RDONLY)
+ 		/*
+ 		 * allow only read-only access to snapshot files
 diff --git a/fs/ext4/ialloc.c b/fs/ext4/ialloc.c
 index 50248e6..767f424 100644
 --- a/fs/ext4/ialloc.c
@@ -134,21 +147,22 @@ index 50248e6..767f424 100644
  		/* set extent flag only for directory, file and normal symlink*/
  		if (S_ISDIR(mode) || S_ISREG(mode) || S_ISLNK(mode)) {
 diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
-index 6d876c8..a861217 100644
+index 6d876c8..3b466e4 100644
 --- a/fs/ext4/inode.c
 +++ b/fs/ext4/inode.c
-@@ -171,6 +171,10 @@ void ext4_evict_inode(struct inode *inode)
- 			filemap_write_and_wait(&inode->i_data);
- 		}
- 		truncate_inode_pages(&inode->i_data, 0);
-+#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
-+		if (ext4_snapclone_file(inode) && ext4_snapshot_list(inode))
-+			ext4_snapclone_destroy(inode);
-+#endif
- 		goto no_delete;
- 	}
+@@ -142,6 +142,11 @@ void ext4_evict_inode(struct inode *inode)
  
-@@ -676,13 +680,30 @@ static int ext4_partial_write_begin(struct inode *inode, sector_t iblock,
+ 	ext4_ioend_wait(inode);
+ 
++#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
++	if (ext4_snapclone_file(inode))
++		ext4_snapclone_destroy(inode);
++#endif
++
+ 	if (inode->i_nlink) {
+ 		/*
+ 		 * When journalling data dirty buffers are tracked only in the
+@@ -676,13 +681,30 @@ static int ext4_partial_write_begin(struct inode *inode, sector_t iblock,
  	map.m_lblk = iblock;
  	map.m_len = 1;
  
@@ -179,7 +193,7 @@ index 6d876c8..a861217 100644
  		ll_rw_block(READ, 1, &bh);
  		wait_on_buffer(bh);
  		/* clear existing block mapping */
-@@ -728,8 +749,14 @@ static int _ext4_get_block(struct inode *inode, sector_t iblock,
+@@ -728,8 +750,14 @@ static int _ext4_get_block(struct inode *inode, sector_t iblock,
  	}
  
  #ifdef CONFIG_EXT4_FS_SNAPSHOT_HOOKS_DATA
@@ -194,7 +208,7 @@ index 6d876c8..a861217 100644
  		/* Read existing block data before moving it to snapshot */
  		ret = ext4_partial_write_begin(inode, iblock, bh);
  		if (ret < 0)
-@@ -767,6 +794,10 @@ int ext4_get_block_mow(struct inode *inode, sector_t iblock,
+@@ -767,6 +795,10 @@ int ext4_get_block_mow(struct inode *inode, sector_t iblock,
  {
  	int flags = create ? EXT4_GET_BLOCKS_CREATE : 0;
  
@@ -205,7 +219,7 @@ index 6d876c8..a861217 100644
  	if (ext4_snapshot_should_move_data(inode))
  		flags |= EXT4_GET_BLOCKS_MOVE_ON_WRITE;
  	return _ext4_get_block(inode, iblock, bh, flags);
-@@ -1000,8 +1031,15 @@ static void ext4_snapshot_write_begin(struct inode *inode,
+@@ -1000,8 +1032,15 @@ static void ext4_snapshot_write_begin(struct inode *inode,
  	 * guarantee this we have to know that the transaction is not restarted.
  	 * Can we count on that?
  	 */
@@ -221,7 +235,7 @@ index 6d876c8..a861217 100644
  		return;
  
  	if (!page_has_buffers(page))
-@@ -1011,14 +1049,19 @@ static void ext4_snapshot_write_begin(struct inode *inode,
+@@ -1011,14 +1050,19 @@ static void ext4_snapshot_write_begin(struct inode *inode,
  	/*
  	 * make sure that get_block() is called even if the buffer is
  	 * mapped, but not if it is already a part of any transaction.
@@ -242,7 +256,7 @@ index 6d876c8..a861217 100644
  			/* read block before moving it to snapshot */
  			set_buffer_partial_write(bh);
  	}
-@@ -1753,6 +1796,10 @@ static void mpage_da_map_and_submit(struct mpage_da_data *mpd)
+@@ -1753,6 +1797,10 @@ static void mpage_da_map_and_submit(struct mpage_da_data *mpd)
  	 * EXT4_GET_BLOCKS_DELALLOC_RESERVE so the delalloc accounting
  	 * variables are updated after the blocks have been allocated.
  	 */
@@ -253,7 +267,7 @@ index 6d876c8..a861217 100644
  	map.m_lblk = next;
  	map.m_len = max_blocks;
  	get_blocks_flags = EXT4_GET_BLOCKS_CREATE;
-@@ -2054,6 +2101,10 @@ static int ext4_da_get_block_prep(struct inode *inode, sector_t iblock,
+@@ -2054,6 +2102,10 @@ static int ext4_da_get_block_prep(struct inode *inode, sector_t iblock,
  	BUG_ON(create == 0);
  	BUG_ON(bh->b_size != inode->i_sb->s_blocksize);
  
@@ -264,7 +278,7 @@ index 6d876c8..a861217 100644
  	map.m_lblk = iblock;
  	map.m_len = 1;
  
-@@ -3064,6 +3115,10 @@ static int ext4_get_block_write(struct inode *inode, sector_t iblock,
+@@ -3064,6 +3116,10 @@ static int ext4_get_block_write(struct inode *inode, sector_t iblock,
  		   inode->i_ino, create);
  	if (ext4_snapshot_should_move_data(inode))
  		flags |= EXT4_GET_BLOCKS_MOVE_ON_WRITE;
@@ -275,12 +289,12 @@ index 6d876c8..a861217 100644
  	return _ext4_get_block(inode, iblock, bh_result, flags);
  #else
  	ext4_debug("ext4_get_block_write: inode %lu, create flag %d\n",
-@@ -3408,6 +3463,25 @@ static const struct address_space_operations ext4_da_aops = {
+@@ -3408,6 +3464,43 @@ static const struct address_space_operations ext4_da_aops = {
  	.is_partially_uptodate  = block_is_partially_uptodate,
  	.error_remove_page	= generic_error_remove_page,
  };
 +#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
-+static const struct address_space_operations ext4_snapclone_aops = {
++static const struct address_space_operations ext4_snapclone_da_aops = {
 +#ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE_READ
 +	.readpage		= ext4_snapshot_readpage,
 +#else
@@ -298,39 +312,50 @@ index 6d876c8..a861217 100644
 +
 +#endif
 +
++#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
++static const struct address_space_operations ext4_snapclone_aops = {
++#ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE_READ
++	.readpage		= ext4_snapshot_readpage,
++#else
++	.readpage		= ext4_readpage,
++	.readpages		= ext4_readpages,
++#endif
++	.writepage		= ext4_writepage,
++	.write_begin		= ext4_write_begin,
++	.write_end		= ext4_ordered_write_end,
++	.bmap			= ext4_bmap,
++	.invalidatepage		= ext4_invalidatepage,
++	.releasepage		= ext4_releasepage,
++};
++
++#endif
++
  #ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE
  static int ext4_no_writepage(struct page *page,
  				struct writeback_control *wbc)
-@@ -3448,6 +3522,11 @@ void ext4_set_aops(struct inode *inode)
- 		inode->i_mapping->a_ops = &ext4_snapfile_aops;
- 	else
- #endif
+@@ -3443,6 +3536,15 @@ static const struct address_space_operations ext4_snapfile_aops = {
+ 
+ void ext4_set_aops(struct inode *inode)
+ {
++	/* We  can not change order of snapclone and snapshot. */
 +#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
-+	if (ext4_snapclone_file(inode))
++	if (ext4_snapclone_file(inode) &&
++		test_opt(inode->i_sb, DELALLOC))
++		inode->i_mapping->a_ops = &ext4_snapclone_da_aops;
++	else if (ext4_snapclone_file(inode))
 +		inode->i_mapping->a_ops = &ext4_snapclone_aops;
 +	else
 +#endif
- 	if (ext4_should_order_data(inode) &&
- 		test_opt(inode->i_sb, DELALLOC))
- 		inode->i_mapping->a_ops = &ext4_da_aops;
-@@ -4078,7 +4157,11 @@ struct inode *ext4_iget(struct super_block *sb, unsigned long ino)
- 		ei->i_data[block] = raw_inode->i_block[block];
- #ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE_STORE
- 	/* snapshot on-disk list is stored in snapshot inode on-disk version */
-+#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
-+	if (ext4_snapshot_file(inode) || ext4_snapclone_file(inode)) {
-+#else
- 	if (ext4_snapshot_file(inode)) {
-+#endif
- 		ei->i_next_snapshot_ino =
- 			le32_to_cpu(raw_inode->i_disk_version);
- 		/*
-@@ -4091,6 +4174,13 @@ struct inode *ext4_iget(struct super_block *sb, unsigned long ino)
+ #ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE
+ 	if (ext4_snapshot_file(inode))
+ 		inode->i_mapping->a_ops = &ext4_snapfile_aops;
+@@ -4090,7 +4192,13 @@ struct inode *ext4_iget(struct super_block *sb, unsigned long ino)
+ 	}
  #endif
  	INIT_LIST_HEAD(&ei->i_orphan);
- 
+-
 +#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
-+	if (ext4_snapclone_file(inode) && ext4_snapshot_list(inode)) {
++	if (ext4_snapclone_file(inode)) {
 +		ret = ext4_snapclone_load(inode);
 +		if (ret)
 +			goto bad_inode;
@@ -339,20 +364,8 @@ index 6d876c8..a861217 100644
  	/*
  	 * Set transaction id's of transactions that have to be committed
  	 * to finish f[data]sync. We set them to currently running transaction
-@@ -4361,7 +4451,11 @@ static int ext4_do_update_inode(handle_t *handle,
- 			raw_inode->i_block[block] = ei->i_data[block];
- 
- #ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE_STORE
-+#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
-+	if (ext4_snapshot_file(inode) || ext4_snapclone_file(inode)) {
-+#else
- 	if (ext4_snapshot_file(inode)) {
-+#endif
- 		/*
- 		 * Snapshot on-disk list overrides snapshot on-disk version.
- 		 * Snapshot files are not writable and have a fixed version.
 diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
-index e239d67..e7286fa 100644
+index e239d67..3924f89 100644
 --- a/fs/ext4/ioctl.c
 +++ b/fs/ext4/ioctl.c
 @@ -87,13 +87,22 @@ long ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
@@ -379,79 +392,69 @@ index e239d67..e7286fa 100644
  			if (!S_ISDIR(inode->i_mode)) {
  				err = -ENOTDIR;
  				goto flags_out;
-@@ -203,8 +212,13 @@ flags_out:
- 		 * Snapshot file state flags can only be changed by
- 		 * the relevant capability and under snapshot_mutex lock.
- 		 */
-+#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
-+		if ((!ext4_snapshot_file(inode) &&
-+		     !ext4_snapclone_file(inode)) || !capable(CAP_SYS_RESOURCE))
-+#else
- 		if (!ext4_snapshot_file(inode) ||
- 				!capable(CAP_SYS_RESOURCE))
-+#endif
- 			return -EPERM;
- 
- 		/* update snapshot 'open' flag under i_mutex */
-@@ -236,8 +250,14 @@ flags_out:
+@@ -236,8 +245,14 @@ flags_out:
  		err = ext4_reserve_inode_write(handle, inode, &iloc);
  		if (err)
  			goto snapflags_err;
 -
 +#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
-+		if (ext4_snapshot_file(inode))
-+			err = ext4_snapshot_set_flags(handle, inode, flags);
-+		else
++		if (ext4_snapclone_file(inode))
 +			err = ext4_snapclone_set_flags(handle, inode, flags);
++		else
++			err = ext4_snapshot_set_flags(handle, inode, flags);
 +#else 
  		err = ext4_snapshot_set_flags(handle, inode, flags);
 +#endif
  		if (err)
  			goto snapflags_err;
  
-@@ -269,6 +289,40 @@ snapflags_out:
- 		return err;
- 	}
- #endif
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index 6f86e8f..7fa0e7f 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -1712,9 +1712,13 @@ static void ext4_dec_count(handle_t *handle, struct inode *inode)
+ 		drop_nlink(inode);
+ }
+ 
+-
 +#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
-+	case EXT4_IOC_SNAPCLONE: {
-+		struct file *snapshot_filp;
-+		unsigned int snapshot_fd;
-+		int err;
-+
-+		if (!inode_owner_or_capable(inode))
-+			return -EACCES;
-+
-+		err = mnt_want_write(filp->f_path.mnt);
-+		if (err)
-+			return err;
-+
-+		if (get_user(snapshot_fd, (int __user *) arg))
-+			return -EFAULT;
-+
-+		if (!ext4_snapclone_file(inode) || !capable(CAP_SYS_RESOURCE))
-+			return -EPERM;
-+
-+		snapshot_filp = fget(snapshot_fd);
-+		if (!snapshot_filp)
-+			return -EINVAL;
-+
-+		if (!ext4_snapshot_file(snapshot_filp->f_dentry->d_inode))
-+			return -EPERM;
-+
-+		mutex_lock(&inode->i_mutex);
-+		err = ext4_snapclone_take(inode,
-+					  snapshot_filp->f_dentry->d_inode);
-+		fput(snapshot_filp);
-+		mutex_unlock(&inode->i_mutex);
-+		return err;
-+	}
++int ext4_add_nondir(handle_t *handle,
++		struct dentry *dentry, struct inode *inode)
++#else
+ static int ext4_add_nondir(handle_t *handle,
+ 		struct dentry *dentry, struct inode *inode)
 +#endif
- 	case EXT4_IOC_GETVERSION:
- 	case EXT4_IOC_GETVERSION_OLD:
- 		return put_user(inode->i_generation, (int __user *) arg);
+ {
+ 	int err = ext4_add_entry(handle, dentry, inode);
+ 	if (!err) {
+@@ -2218,8 +2222,13 @@ static int ext4_unlink(struct inode *dir, struct dentry *dentry)
+ 	}
+ #ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE_PERM
+ 	/* prevent unlink of files on snapshot list */
++#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
++	if (inode->i_nlink > 1 ||
++	    (inode->i_nlink == 1 && ext4_snapshot_list(inode))) {
++#else
+ 	if (inode->i_nlink == 1 &&
+ 		ext4_snapshot_list(inode)) {
++#endif
+ 		snapshot_debug(1, "snapshot (%u) cannot be unlinked!\n",
+ 				inode->i_generation);
+ 		retval = -EPERM;
+@@ -2363,6 +2372,11 @@ static int ext4_link(struct dentry *old_dentry,
+ 	if (inode->i_nlink >= EXT4_LINK_MAX)
+ 		return -EMLINK;
+ 
++#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
++	if (ext4_snapshot_file(inode))
++		return ext4_snapclone_take(old_dentry, dir, dentry);
++#endif
++
+ 	dquot_initialize(dir);
+ 
+ retry:
 diff --git a/fs/ext4/snapshot.h b/fs/ext4/snapshot.h
-index 9b91f16..8cff1cb 100644
+index 9b91f16..8c954c9 100644
 --- a/fs/ext4/snapshot.h
 +++ b/fs/ext4/snapshot.h
 @@ -417,6 +417,15 @@ extern int ext4_snapshot_update(struct super_block *sb, int cleanup,
@@ -459,8 +462,8 @@ index 9b91f16..8cff1cb 100644
  #endif
  
 +#ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE
-+extern int ext4_snapclone_take(struct inode *clone_inode,
-+			       struct inode *snap_inode);
++extern int ext4_snapclone_take(struct dentry *old_dentry, struct inode *dir,
++			struct dentry *dentry);
 +extern long ext4_snapclone_load(struct inode *);
 +extern void ext4_snapclone_destroy(struct inode *);
 +extern int ext4_snapclone_set_flags(handle_t *handle, struct inode *inode,
@@ -506,10 +509,10 @@ index 9b91f16..8cff1cb 100644
  #ifdef CONFIG_EXT4_FS_SNAPSHOT_FILE
  /*
 diff --git a/fs/ext4/snapshot_ctl.c b/fs/ext4/snapshot_ctl.c
-index 330d5a3..92168f9 100644
+index 330d5a3..c4eba6b 100644
 --- a/fs/ext4/snapshot_ctl.c
 +++ b/fs/ext4/snapshot_ctl.c
-@@ -387,6 +387,72 @@ void ext4_snapshot_get_flags(struct inode *inode, struct file *filp)
+@@ -387,6 +387,67 @@ void ext4_snapshot_get_flags(struct inode *inode, struct file *filp)
  		ext4_clear_inode_snapstate(inode, EXT4_SNAPSTATE_SHRUNK);
  }
  
@@ -519,10 +522,6 @@ index 330d5a3..92168f9 100644
 + */
 +static int ext4_snapclone_enable(struct inode *inode)
 +{
-+	int err;
-+	err = ext4_snapclone_load(inode);
-+	if (err)
-+		return err;
 +	/*
 +	 * set i_size to block device size to enable loop device mount
 +	 */
@@ -543,7 +542,6 @@ index 330d5a3..92168f9 100644
 +	SNAPSHOT_SET_DISABLED(inode);
 +	ext4_clear_inode_snapstate(inode, EXT4_SNAPSTATE_ENABLED);
 +	ext4_clear_inode_snapstate(inode, EXT4_SNAPSTATE_LIST);
-+	ext4_snapclone_destroy(inode);
 +	/* Don't need i_size_read because we hold i_mutex */
 +	snapshot_debug(4, "setting snapclone inode (%lu) i_size to (%lld)\n",
 +		       inode->i_ino, inode->i_size);
@@ -582,7 +580,7 @@ index 330d5a3..92168f9 100644
  /*
   * ext4_snapshot_set_flags() monitors snapshot state changes
   * Called from ext4_ioctl() under i_mutex and snapshot_mutex
-@@ -563,6 +629,36 @@ static ext4_fsblk_t ext4_get_inode_block(struct super_block *sb,
+@@ -563,6 +624,36 @@ static ext4_fsblk_t ext4_get_inode_block(struct super_block *sb,
  	return block;
  }
  
@@ -619,7 +617,7 @@ index 330d5a3..92168f9 100644
  /*
   * ext4_snapshot_create() initializes a snapshot file
   * and adds it to the list of snapshots
-@@ -626,6 +722,10 @@ static int ext4_snapshot_create(struct inode *inode)
+@@ -626,6 +717,10 @@ static int ext4_snapshot_create(struct inode *inode)
  		return -EINVAL;
  	}
  
@@ -630,7 +628,7 @@ index 330d5a3..92168f9 100644
  	/* verify that no inode blocks are allocated */
  	for (i = 0; i < EXT4_N_BLOCKS; i++) {
  		if (ei->i_data[i])
-@@ -641,6 +741,7 @@ static int ext4_snapshot_create(struct inode *inode)
+@@ -641,6 +736,7 @@ static int ext4_snapshot_create(struct inode *inode)
  				inode->i_size, ei->i_disksize);
  		return -EINVAL;
  	}
@@ -638,35 +636,42 @@ index 330d5a3..92168f9 100644
  
  	/*
  	 * Take a reference to the small transaction that started in
-@@ -893,6 +994,132 @@ static char *copy_inode_block_name[COPY_INODE_BLOCKS_NUM] = {
+@@ -893,6 +989,170 @@ static char *copy_inode_block_name[COPY_INODE_BLOCKS_NUM] = {
  };
  #endif
  
 +#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
 +/*
-+ * ext4_snapclone_take() makes a new snapshot file
-+ * into the active snapshot
++ * ext4_snapclone_take() makes a new snapclone file.
 + *
-+ * Called from ext4_ioctl() under i_mutex
++ * Called from ext4_link() under i_mutex. [ln snapclone file  snapshot file]
++ * creates a snapclone file for a snapshot file.
 + */
-+int ext4_snapclone_take(struct inode *clone_inode, struct inode *snap_inode)
++int ext4_snapclone_take(struct dentry *old_dentry, struct inode *dir,
++			struct dentry *dentry)
 +{
-+	struct ext4_iloc iloc;
++	struct ext4_iloc snap_iloc;
++	struct inode *snap_inode = old_dentry->d_inode;
++	struct inode *clone_inode;
 +	struct buffer_head *snap_es_bh = NULL, *clone_es_bh = NULL;
 +	struct ext4_super_block *es = NULL;
-+	struct super_block *sb = clone_inode->i_sb;
-+	struct ext4_sb_info *sbi = EXT4_SB(sb);
-+	handle_t *handle;
-+	int err = -EIO, ret;
-+
-+	if (!ext4_is_empty_file(clone_inode))
-+		return -EINVAL;
++	handle_t *handle = NULL;
++	int err = -EIO, ret, credits, retries;
 +
 +	/*
-+	 * Get super block of the snapshot, we need to copy it to snapclone and
-+	 * fix IS_SNAPSHOT flag, so that snapclone can be mounted.
++	 * We have to add entry to directory
++	 * (EXT4_DATA_TRANS_BLOCKS + EXT4_INDEX_EXTRA_TRANS_BLOCKS),
++	 * allocate new inode (bitmap, group descriptor, inode block,
++	 * quota blocks, sb is already counted in previous macros).
++	 * increment nlink count of snap_inode.
 +	 */
-+
++	credits = EXT4_DATA_TRANS_BLOCKS(dir->i_sb) +
++		  EXT4_INDEX_EXTRA_TRANS_BLOCKS + 3 +
++		  EXT4_MAXQUOTAS_INIT_BLOCKS(dir->i_sb) + 1;
++	/*
++	 * Get super block of the snapshot, we need to copy it to snapclone and
++	 * fix IS_SNAPSHOT flag, so that snapclone can be mounted writable.
++	 */
 +	snap_es_bh = ext4_bread(NULL, snap_inode, SNAPSHOT_IBLOCK(0),
 +				SNAPMAP_READ, &err);
 +	if (!snap_es_bh || snap_es_bh->b_blocknr == 0) {
@@ -675,33 +680,37 @@ index 330d5a3..92168f9 100644
 +		goto out_err;
 +	}
 +
-+	/*
-+	 * Take a reference to the small transaction that started in
-+	 * ext4_ioctl() We will extend or restart this transaction as we go
-+	 * along.  journal_start(n > 1) would not have increase the buffer
-+	 * credits.
-+	 */
-+	handle = ext4_journal_start(clone_inode, 1);
-+	err = ext4_reserve_inode_write(handle, clone_inode, &iloc);
-+	if (err)
-+		return err;
++retry:
++	handle = ext4_journal_start_sb(dir->i_sb, credits);
++	if (IS_ERR(handle)) {
++		err = PTR_ERR(handle);
++		goto out_err;
++	}
 +
-+	snapshot_debug(4, "add clone inode %lu to snap inode %lu\n",
-+		       clone_inode->i_ino, snap_inode->i_ino);
++	if (IS_DIRSYNC(dir))
++		ext4_handle_sync(handle);
++
++	clone_inode = ext4_new_inode(handle, dir, S_IFREG|S_IRWXUGO,
++			       &dentry->d_name, 0, NULL);
++	err = PTR_ERR(clone_inode);
++	if (IS_ERR(clone_inode))
++		goto out_abort_handle;
++
++	clone_inode->i_op = &ext4_file_inode_operations;
++	clone_inode->i_fop = &ext4_file_operations;
++
 +	/* pre-allocate and zero out [d,t]ind blocks */
 +	err = ext4_snapshot_preallocate(handle, clone_inode,
 +					SNAPSHOT_BLOCKS(snap_inode));
 +	if (err) {
 +		snapshot_debug(1, "failed to pre-allocate tind blocks"
 +			       " for snapclone (%lu)\n", clone_inode->i_ino);
-+		goto out_handle;
++		goto out_drop_inode;
 +	}
 +
-+	/* allocate super block for snapclone file */
 +	err = extend_or_restart_transaction_inode(handle, clone_inode,
-+			EXT4_DATA_TRANS_BLOCKS(sb));
-+	if (err)
-+		goto out_handle;
++				EXT4_DATA_TRANS_BLOCKS(dir->i_sb));
++
 +	err = ext4_snapshot_map_blocks(handle, clone_inode, 0, 1,
 +				       NULL, SNAPMAP_WRITE);
 +	if (err <= 0) {
@@ -709,23 +718,41 @@ index 330d5a3..92168f9 100644
 +			       "snapclone (%lu)\n", clone_inode->i_ino);
 +		if (err)
 +			err = -EIO;
-+		goto out_handle;
++		goto out_drop_inode;
 +	}
++
++	err = ext4_reserve_inode_write(handle, snap_inode, &snap_iloc);
++	if (err)
++		goto out_drop_inode;
++
++	snapshot_debug(4, "add clone inode %lu to snap inode %lu\n",
++		       clone_inode->i_ino, snap_inode->i_ino);
 +
 +	/*
 +	 * Link clone inode to snap inode, so that we can find snap inode via
 +	 * clone inode.
 +	 */
 +	NEXT_SNAPSHOT(clone_inode) = snap_inode->i_ino;
-+
 +	/* record the file system size in the clone inode disksize field */
 +	SNAPSHOT_SET_BLOCKS(clone_inode, SNAPSHOT_BLOCKS(snap_inode));
-+
-+	err = ext4_mark_inode_dirty(handle, clone_inode);
-+
-+	/* Link clone inode to snap inode via prev. */
++	/* set SNAPCLONE flag */
++	EXT4_I(clone_inode)->i_flags |= EXT4_SNAPCLONE_FL | EXT4_SNAPFILE_FL;
++	ext4_set_aops(clone_inode);
++	err = ext4_add_nondir(handle, dentry, clone_inode);
 +	if (err)
-+		goto out_handle;
++		goto out_drop_inode;
++
++	inc_nlink(snap_inode);
++	ihold(snap_inode);
++	err = ext4_mark_iloc_dirty(handle, snap_inode, &snap_iloc);
++	if (err) {
++		drop_nlink(snap_inode);
++		iput(snap_inode);
++		goto out_abort_handle;
++	}
++
++	/* Link clone inode to snap inode via prev in memory. */
++	EXT4_I(clone_inode)->i_snaplist.prev = &EXT4_I(snap_inode)->i_snaplist;
 +	EXT4_I(clone_inode)->i_snaplist.prev = &EXT4_I(snap_inode)->i_snaplist;
 +
 +	/* get super block of snapclone */
@@ -736,8 +763,9 @@ index 330d5a3..92168f9 100644
 +		snapshot_debug(1, "warning: super block of snapclone inode %lu "
 +			       "not allocated\n", clone_inode->i_ino);
 +		err = -EIO;
-+		goto out_handle;
++		goto out_abort_handle;
 +	} else {
++		struct ext4_sb_info *sbi = EXT4_SB(dir->i_sb);
 +		snapshot_debug(4, "super block of snapclone (%lu) mapped to "
 +			       "block (%lld)\n", clone_inode->i_ino,
 +			       (long long)clone_es_bh->b_blocknr);
@@ -748,19 +776,27 @@ index 330d5a3..92168f9 100644
 +
 +	/*copy super block */
 +	lock_buffer(clone_es_bh);
-+	memcpy(clone_es_bh->b_data, snap_es_bh->b_data, sb->s_blocksize);
-+	/* clear the IS_SNAPSHOT flag */
++	memcpy(clone_es_bh->b_data, snap_es_bh->b_data, dir->i_sb->s_blocksize);
++	/* clear the IS_SNAPSHOT and HAS_SNAPSHOT flag */
 +	es->s_flags &= ~cpu_to_le32(EXT4_FLAGS_IS_SNAPSHOT);
 +	set_buffer_uptodate(clone_es_bh);
 +	unlock_buffer(clone_es_bh);
 +	mark_buffer_dirty(clone_es_bh);
-+	sync_dirty_buffer(clone_es_bh);
++	err = sync_dirty_buffer(clone_es_bh);
 +
-+out_handle:
 +	ret = ext4_journal_stop(handle);
++	if (err == -ENOSPC && ext4_should_retry_alloc(dir->i_sb, &retries))
++		goto retry;
 +	if (!err)
 +		err = ret;
-+
++	goto out_err;
++out_drop_inode:
++	drop_nlink(clone_inode);
++	unlock_new_inode(clone_inode);
++	iput(clone_inode);
++out_abort_handle:
++	ext4_journal_abort_handle(__func__, __LINE__, "ext4_snapclone_take",
++				  NULL, handle, err);
 +out_err:
 +	brelse(snap_es_bh);
 +	brelse(clone_es_bh);
@@ -771,7 +807,7 @@ index 330d5a3..92168f9 100644
  /*
   * ext4_snapshot_take() makes a new snapshot file
   * into the active snapshot
-@@ -1341,6 +1568,15 @@ static int ext4_snapshot_delete(struct inode *inode)
+@@ -1341,6 +1601,15 @@ static int ext4_snapshot_delete(struct inode *inode)
  		return -EINVAL;
  	}
  
@@ -787,7 +823,7 @@ index 330d5a3..92168f9 100644
  	if (ext4_test_inode_snapstate(inode, EXT4_SNAPSTATE_ENABLED)) {
  		snapshot_debug(1, "delete of enabled snapshot (%u) "
  			       "is not permitted\n",
-@@ -1845,6 +2081,55 @@ static int ext4_snapshot_cleanup(struct inode *inode, struct inode *used_by,
+@@ -1845,6 +2114,56 @@ static int ext4_snapshot_cleanup(struct inode *inode, struct inode *used_by,
  
  #endif
  #endif
@@ -836,6 +872,7 @@ index 330d5a3..92168f9 100644
 +	snapshot_debug(1, "unlinking snap inode %lu from clone inode %lu\n",
 +		       ei->vfs_inode.i_ino, inode->i_ino);
 +	iput(&ei->vfs_inode);
++	snapshot_debug(1, "inode %lu count %d\n", ei->vfs_inode.i_ino, ei->vfs_inode.i_count);
 +	EXT4_I(inode)->i_snaplist.prev = &EXT4_I(inode)->i_snaplist;
 +}
 +
@@ -844,10 +881,10 @@ index 330d5a3..92168f9 100644
   * Snapshot constructor/destructor
   */
 diff --git a/fs/ext4/snapshot_inode.c b/fs/ext4/snapshot_inode.c
-index 796b355..9aa4c29 100644
+index 796b355..1da3632 100644
 --- a/fs/ext4/snapshot_inode.c
 +++ b/fs/ext4/snapshot_inode.c
-@@ -645,19 +645,27 @@ static int ext4_snapshot_get_block_access(struct inode *inode,
+@@ -645,18 +645,21 @@ static int ext4_snapshot_get_block_access(struct inode *inode,
  		return 0;
  
  #ifdef CONFIG_EXT4_FS_SNAPSHOT_LIST_READ
@@ -869,16 +906,10 @@ index 796b355..9aa4c29 100644
  	ei = list_entry(prev, struct ext4_inode_info, i_snaplist);
  	*prev_snapshot = &ei->vfs_inode;
 -
-+#ifdef CONFIG_EXT4_FS_SNAPCLONE_FILE
-+	if (!ext4_snapshot_file(*prev_snapshot) &&
-+	    !ext4_snapclone_file(*prev_snapshot))
-+#else
  	if (!ext4_snapshot_file(*prev_snapshot))
-+#endif
  		/* non snapshot file on the list? */
  		return -EIO;
- 
-@@ -919,8 +927,13 @@ static int ext4_snapshot_is_bitmap(struct super_block *sb,
+@@ -919,8 +922,13 @@ static int ext4_snapshot_is_bitmap(struct super_block *sb,
  	return is_bitmap;
  }
  
@@ -892,3 +923,20 @@ index 796b355..9aa4c29 100644
  {
  	ext4_group_t block_group;
  	int err, is_bitmap;
+diff --git a/fs/super.c b/fs/super.c
+index 6277ec6..35824ca 100644
+--- a/fs/super.c
++++ b/fs/super.c
+@@ -395,6 +395,12 @@ void generic_shutdown_super(struct super_block *sb)
+ 			sop->put_super(sb);
+ 
+ 		if (!list_empty(&sb->s_inodes)) {
++			struct list_head *l;
++			list_for_each(l, &sb->s_inodes) {
++				struct inode *inode;
++				inode = list_entry(l, struct inode, i_sb_list);
++				printk("VFS: inode on %lu\n", inode->i_ino);
++			}
+ 			printk("VFS: Busy inodes after unmount of %s. "
+ 			   "Self-destruct in 5 seconds.  Have a nice day...\n",
+ 			   sb->s_id);
